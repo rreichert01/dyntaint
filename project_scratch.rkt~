@@ -1,0 +1,419 @@
+#lang racket
+(require redex)
+
+
+(define-language TAINT
+  (s ::= (= e e) (if e S S) (while e S) (= var alloc)
+     (alloc-source Src e t) (alloc-sink Snk e t e) (alloc-prop Prop e t t) (alloc-sanit San e t t)
+     (apply-source Src var) (apply-sink Snk var) (apply-prop Prop var var) (apply-sanit San var var))
+  (e ::= (op e e) var const true false null)
+  (op ::= add sub mult div eq? neq?)
+  (var ::= variable-not-otherwise-mentioned)
+  (const ::= real)
+  (t ::= integer)
+  (Src ::= string)
+  (Snk ::= string)
+  (San ::= string)
+  (Prop ::= string)
+  (S ::=  s (S ...)))
+
+(define-extended-language RT-TAINT
+  TAINT
+  (e ::= .... t)
+  (SP ::= Src Snk San Prop)
+  (ρ ::= (const t) (true t) (false t) (null t))
+  (ρ+ ::= ρ (error t) SPρ)
+  (SPρ ::= (e t) (e t e) (e t t))
+  (vs ::= mt (e ρ vs) (SP SPρ vs)))
+
+(default-language TAINT)
+
+(define-metafunction RT-TAINT
+  ⇓ : e vs -> ρ+
+  [(⇓ const vs) (const 0)]
+  [(⇓ null vs) (null 0)]
+  [(⇓ true vs) (true 0)]
+  [(⇓ false vs) (false 0)]
+  [(⇓ var vs) (lookup var vs)]
+  [(⇓ (op e_1 e_2) vs) (BinOP op (⇓ e_1 vs) (⇓ e_2 vs))]
+  )
+
+(define-metafunction RT-TAINT
+  lookup : var vs -> ρ+
+  [(lookup var (var ρ vs)) ρ]
+  [(lookup var_1 (var_2 ρ vs)) (lookup var_1 vs)]
+  [(lookup var (SP SPρ vs)) (lookup var vs)]
+  [(lookup var mt) (error 0)])
+
+(define-metafunction RT-TAINT
+  lookup-SP : SP vs -> ρ+
+  [(lookup-SP SP (SP SPρ vs)) SPρ]
+  [(lookup-SP SP_1 (SP_2 SPρ vs)) (lookup-SP SP_1 vs)]
+  [(lookup-SP SP (var ρ vs)) (lookup-SP SP vs)]
+  [(lookup-SP SP mt) (error 0)])
+
+
+
+(define-metafunction RT-TAINT
+  BinOP : op (e_1 t_1) (e_2 t_2) -> ρ+
+  [(BinOP add (e_1 t_1) (e_2 t_2)) (,(+ (term e_1) (term e_2)) ,(max (term t_1) (term t_2)))]
+  [(BinOP sub (e_1 t_1) (e_2 t_2)) (,(- (term e_1) (term e_2)) ,(max (term t_1) (term t_2)))]
+  [(BinOP mult (e_1 t_1) (e_2 t_2)) (,(* (term e_1) (term e_2)) ,(max (term t_1) (term t_2)))]
+  [(BinOP div (e_1 t_1) (0 t_2)) ( error ,(max (term t_1) (term t_2)))]
+  [(BinOP div (e_1 t_1) (e_2 t_2)) (,(/ (term e_1) (term e_2)) ,(max (term t_1) (term t_2)))]
+  [(BinOP eq? (e_1 t_1) (e_2 t_2)) (, (if (eq? (term e_1) (term e_2)) (term true) (term false)),(max (term t_1) (term t_2)))]
+  [(BinOP neq? (e_1 t_1) (e_2 t_2)) (, (if (eq? (term e_1) (term e_2)) (term false) (term true)),(max (term t_1) (term t_2)))])
+
+(define-metafunction RT-TAINT
+  Extend : var vs -> vs
+  [(Extend var vs) (var (null 0) vs)])
+
+(define-metafunction RT-TAINT
+  Extend-SP : SP SPρ vs -> vs
+  [(Extend-SP SP SPρ vs) (SP SPρ vs)])
+
+(define-metafunction RT-TAINT
+  Assign : var ρ vs -> vs
+  [(Assign var ρ_1 (var ρ_2 vs)) (var ρ_1 vs)]
+  [(Assign var_1 ρ_1 (var_2 ρ_2 vs))
+   (var_2 ρ_2 (Assign var_1 ρ_1 vs))]
+  [(Assign var ρ (SP SPρ vs)) (SP SPρ (Assign var ρ vs))]) 
+  
+(define -->T
+  (reduction-relation
+   RT-TAINT
+   ;[--> (control vs program)]
+   ;Alloc
+   [--> ((= var alloc) vs S)
+        (skip (Extend var vs) S)
+        alloc]
+   ;skip
+   [--> (skip vs (S_1 S_2 ...))
+        (S_1 vs (S_2 ...))
+        skip]
+   ;assign
+   [--> ((= var e) vs S)
+        (skip (Assign var (⇓ e vs) vs) S)
+        assign]
+   ;if-T
+    [--> ((if e S_1 S_2) vs S)
+        (S_1 vs S)
+        (side-condition (eq? (term ,(first (term (⇓ e vs)))) (term true)))
+        if-T]
+    ;if-F
+   [--> ((if e S_1 S_2) vs S)
+        (S_2 vs S)
+        (side-condition (eq? (term ,(first (term (⇓ e vs)))) (term false)))
+        if-F]
+   ;while-T
+   [--> ((while e S) vs (S_1 ...))
+        (S vs ((while e S) S_1 ...))
+        (side-condition (eq? (term ,(first (term (⇓ e vs)))) (term true)))
+        while-T]
+   ;while-F
+   [--> ((while e S) vs S)
+        (skip vs S)
+        (side-condition (eq? (term ,(first (term (⇓ e vs)))) (term false)))
+        while-F]
+   ;seqn
+   [--> ((S_1 S_2 ...) vs (S_3 ...))
+        (S_1 vs (S_2 ... S_3 ...))
+        seqn]
+   ;alloc-source
+   [--> ((alloc-source Src e_1 t) vs S)
+        (skip (Extend-SP Src (,(first (term (⇓ e_1 mt))) t) vs) S)
+        alloc-src]
+   ;alloc-sink
+   [--> ((alloc-sink Snk e_1 t e_2) vs S)
+        (skip (Extend-SP Snk (e_1 t e_2) vs) S)
+        alloc-snk]
+   ;alloc-prop
+   [--> ((alloc-prop Prop e t_1 t_2) vs S)
+        (skip (Extend-SP Prop (e t_1 t_2) vs) S)
+        alloc-prop]
+   ;alloc-sanit
+   [--> ((alloc-sanit San e t_1 t_2) vs S)
+        (skip (Extend-SP San (e t_1 t_2) vs) S)
+        alloc-sanit]
+   ;apply-source
+   [--> ((apply-source Src var) vs S)
+        (skip (Assign var (lookup-SP Src vs) vs) S)
+        apply-source]
+   ;apply-sink
+   [--> ((apply-sink Snk var) vs S)
+         (skip vs S)
+         (side-condition (eq? (term ,(second (term (lookup-SP Snk vs)))) (term ,(second (term (lookup var vs))))))
+          apply-sink]
+   ;apply-sink-fail
+   [--> ((apply-sink Snk var) vs S)
+        (error 0)
+        (side-condition (not (eq? (term ,(second (term (lookup-SP Snk vs)))) (term ,(second (term (lookup var vs)))))))
+        apply-sink-fail]
+   ;apply-prop
+   [--> ((apply-prop Prop var_1 var_2) vs S)
+        (skip (Assign var_2 (,(first (term (⇓ ,(first (term (lookup-SP Prop vs))) (var_1 (lookup var_1 vs) mt))))
+                             ,(third (term (lookup-SP Prop vs)))) vs) S)
+        (side-condition (eq? (term ,(second (term (lookup-SP Prop vs)))) (term, (second (term (lookup var_1 vs))))))
+        apply-prop]
+   ;apply-prop-fail
+   [--> ((apply-prop Prop var_1 var_2) vs S)
+        (error 0)
+        (side-condition (not (eq? (term ,(second (term (lookup-SP Prop vs)))) (term, (second (term (lookup var_1 vs)))))))
+        apply-prop-fail]
+   ;apply-sanit
+   [--> ((apply-sanit San var_1 var_2) vs S)
+        (skip (Assign var_2 (,(first (term (⇓ ,(first (term (lookup-SP San vs))) (var_1 (lookup var_1 vs) mt))))
+                             ,(third (term (lookup-SP San vs)))) vs) S)
+        (side-condition (eq? (term ,(second (term (lookup-SP San vs)))) (term, (second (term (lookup var_1 vs))))))
+        apply-sanit]
+   ;apply-sanit-fail
+   [--> ((apply-sanit San var_1 var_2) vs S)
+        (error 0)
+        (side-condition (not (eq? (term ,(second (term (lookup-SP San vs)))) (term, (second (term (lookup var_1 vs)))))))
+        apply-sanit-fail]
+   ))
+
+
+
+;                                                   
+;                                                   
+;  ;;;;;;;                 ;       ;                
+;     ;                    ;                        
+;     ;     ;;;    ;;;   ;;;;;   ;;;   ; ;;    ;;;; 
+;     ;    ;;  ;  ;   ;    ;       ;   ;;  ;  ;;  ; 
+;     ;    ;   ;; ;        ;       ;   ;   ;  ;   ; 
+;     ;    ;;;;;;  ;;;     ;       ;   ;   ;  ;   ; 
+;     ;    ;          ;    ;       ;   ;   ;  ;   ; 
+;     ;    ;      ;   ;    ;       ;   ;   ;  ;; ;; 
+;     ;     ;;;;   ;;;     ;;;   ;;;;; ;   ;   ;;;; 
+;                                                 ; 
+;                                              ;  ; 
+;                                               ;;  
+
+
+(define (load-T p)
+  (cond
+    [(redex-match? TAINT S p) (term (skip mt ,p))]
+    [else (raise "load: expected a valid TAINT program")]))
+
+(define (get-vs p)
+  (second (first p)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((= x alloc)))))))
+ (term (x (null 0) mt)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((= x alloc) (= x 4)))))))
+ (term (x (4 0) mt)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((= x alloc) (if true (= x 4) (= x 2))))))))
+ (term (x (4 0) mt)))
+
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((= x alloc) (if false (= x 4) (= x 2))))))))
+ (term (x (2 0) mt)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((= x alloc) (while false  ((= x 4) (= x 2)))))))))
+ (term (x (null 0) mt)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((= x alloc) (while (eq? x null) ((= x 4) (= x 2)))
+                               ))))))
+ (term (x (2 0) mt)))
+
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((= x alloc) (= x 1) (while (neq? x 5) (= x (add x 1)))
+                               ))))))
+ (term (x (5 0) mt)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((alloc-source "source1" true 1)))))))
+ (term ("source1" (true 1) mt)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((alloc-source "source2" 1.11 0)))))))
+ (term ("source2" (1.11 0) mt)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((alloc-sink "sink1" x 2 false)))))))
+ (term ("sink1" (x 2 false) mt)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term ((alloc-sanit "san" (neq? x y) 2 0)))))))
+ (term ("san" ((neq? x y) 2 0) mt)))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term (
+                   (alloc-source "source2" 1.11 0)
+                   (= x alloc)
+                   (apply-source "source2" x)))))))
+ (term (x (1.11 0) ("source2" (1.11 0) mt))))
+
+(test-equal
+ (term
+  ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term (
+                   (alloc-sink "sink1" x 0 false)
+                   (= x alloc)
+                   (= x 4)
+                   (apply-sink "sink1" x)))))))
+ (term (x (4 0) ("sink1" (x 0 false) mt))))
+
+
+(test-equal
+   (apply-reduction-relation*
+    -->T
+    (load-T (term (
+                   (alloc-sink "sink1" x 3 false)
+                   (= x alloc)
+                   (= x 4)
+                   (apply-sink "sink1" x)))))
+ (term ((error 0))))
+
+(test-equal
+  (term
+   ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term (
+                   (alloc-prop "prop1" y 0 2)
+                   (= y alloc)
+                   (= y 4)
+                   (= x alloc)
+                   (= x true)
+                   (apply-prop "prop1" y x)))))))
+ (term (x (4 2) (y (4 0) ("prop1" (y 0 2) mt)))))
+
+(test-equal
+   (apply-reduction-relation*
+    -->T
+    (load-T (term (
+                   (alloc-prop "prop1" y 1 2)
+                   (= y alloc)
+                   (= y 4)
+                   (= x alloc)
+                   (= x true)
+                   (apply-prop "prop1" y x)))))
+ (term ((error 0))))
+
+(test-equal
+  (term
+   ,(get-vs
+   (apply-reduction-relation*
+    -->T
+    (load-T (term (
+                   (alloc-sanit "san1" (add 2 y) 0 2)
+                   (= y alloc)
+                   (= y 4)
+                   (= x alloc)
+                   (= x true)
+                   (apply-sanit "san1" y x)))))))
+ (term (x (6 2) (y (4 0) ("san1" ((add 2 y) 0 2) mt)))))
+
+;(traces -->T (load-T (term ((= x alloc) (while true ((= x 4) (= x 2))) (= x 1)))))
+
+
+;(test-equal (term (false 0)) (term (⇓ (eq? x y) (y (2 0)(x (3 0) mt)))))
+;(test-equal (term (true 0)) (term (⇓ (eq? x y) (y (3 0)(x (3 0) mt)))))
+;(test-equal (term (true 2)) (term (⇓ (eq? x y) (y (3 2)(x (3 0) mt)))))
+;(test-equal (term (false 2)) (term (⇓ (eq? x y) (y (2 2)(x (3 0) mt)))))
+
+
+;(test-match RT-TAINT e (term true))
+;(test-match RT-TAINT e (term false))
+;(test-match RT-TAINT e (term null))
+;(test-match RT-TAINT e (term x))
+;(test-match RT-TAINT e (term 4))
+;(test-match RT-TAINT var (term x))
+;(test-match RT-TAINT const (term 4))
+;(test-match RT-TAINT t (term 0))
+;(test-match RT-TAINT t (term 0))
+;(test-match RT-TAINT ρ (term (3 4)))
+;(test-match RT-TAINT vs (term mt))
+;(test-match RT-TAINT vs (term (var_1 (3 1) mt)))
+;
+;(test-equal (term (4 0)) (term (⇓ 4 mt)))
+;(test-equal (term (null 0)) (term (⇓ null mt)))
+;(test-equal (term (true 0)) (term (⇓ true mt)))
+;(test-equal (term (false 0)) (term (⇓ false mt)))
+;(test-equal (term (3 0)) (term (⇓ x (x (3 0) mt))))
+;(test-equal (term (3 0)) (term (⇓ x (y (2 0 )(x (3 0) mt)))))
+;(test-equal (term (error 0)) (term (⇓ z (y (2 0 )(x (3 0) mt)))))
+;
+;(test-equal (term (4 8)) (term (⇓ z (y (2 0 ) (z (4 8) (x (3 0) mt))))))
+;(test-equal (term (5 0)) (term (⇓ (add x y) (y (2 0)(x (3 0) mt)))))
+;(test-equal (term (5 4)) (term (⇓ (add x y) (y (2 4)(x (3 0) mt)))))
+;(test-equal (term (5 1)) (term (⇓ (add x y) (y (2 1)(x (3 1) mt)))))
+;(test-equal (term (5 2)) (term (⇓ (add x y) (y (2 2)(x (3 1) mt)))))
+;
+;(test-equal (term (-1 0)) (term (⇓ (sub y x) (y (2 0)(x (3 0) mt)))))
+;(test-equal (term (-1 4)) (term (⇓ (sub y x) (y (2 4)(x (3 0) mt)))))
+;(test-equal (term (1 1)) (term (⇓ (sub y x) (y (4 1)(x (3 1) mt)))))
+;(test-equal (term (5 2)) (term (⇓ (sub y x) (y (2 2)(x (-3 1) mt)))))
+;
+;(test-equal (term (6 0)) (term (⇓ (mult y x) (y (2 0)(x (3 0) mt)))))
+;(test-equal (term (6 4)) (term (⇓ (mult y x) (y (2 4)(x (3 0) mt)))))
+;(test-equal (term (12 1)) (term (⇓ (mult y x) (y (4 1)(x (3 1) mt)))))
+;(test-equal (term (-6 2)) (term (⇓ (mult y x) (y (2 2)(x (-3 1) mt)))))
+;(test-equal (term (0 2)) (term (⇓ (mult y x) (y (2 2)(x (0 1) mt)))))
+;
+;(test-equal (term (2/3 0)) (term (⇓ (div y x) (y (2 0)(x (3 0) mt)))))
+;(test-equal (term (1/4 4)) (term (⇓ (div y x) (y (2 4)(x (8 0) mt)))))
+;(test-equal (term (2 1)) (term (⇓ (div y x) (y (4 1)(x (2 1) mt)))))
+;(test-equal (term (-1/2 2)) (term (⇓ (div y x) (y (2 2)(x (-4 1) mt)))))
+;(test-equal (term (error 2)) (term (⇓ (div y x) (y (2 2)(x (0 1) mt)))))

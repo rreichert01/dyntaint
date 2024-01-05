@@ -1,0 +1,25 @@
+Figure 7
+
+Not yet implemented:
+- source
+- sink
+- sink-fail
+- sanitizer
+- propagator
+
+Implemented:
+- assign
+- load
+- alloc
+- skip
+- if-T
+- if-F
+- while-T
+- while-F
+- BinOP
+- var
+- const
+- null
+- true
+- false
+- sequence
